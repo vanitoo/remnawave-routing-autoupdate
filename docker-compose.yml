@@ -1,7 +1,6 @@
 services:
   routing-updater:
     build: .
-    image: ghcr.io/vanitoo/remnawave-routing-autoupdate:latest
     container_name: remnawave-routing-autoupdate
     restart: unless-stopped
     env_file:
