@@ -1,255 +1,301 @@
+import base64
+import copy
+import json
+import logging
 import os
 import time
-import logging
+
 import requests
-import urllib3
-from datetime import datetime
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger(__name__)
+log = logging.getLogger("routing-updater")
 
 REMNA_BASE_URL = os.environ["REMNA_BASE_URL"].rstrip("/")
 REMNA_API_URL = f"{REMNA_BASE_URL}/subscription-settings"
-REMNA_TOKEN = os.environ["REMNA_TOKEN"]
+REMNA_TOKEN = os.environ["REMNA_TOKEN"].strip()
+
 GITHUB_RAW_URL = os.environ.get(
     "GITHUB_RAW_URL",
-    "https://raw.githubusercontent.com/hydraponique/roscomvpn-happ-routing/refs/heads/main/HAPP/DEFAULT.DEEPLINK",
-)
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))  # seconds
-CRON_SCHEDULE = os.environ.get("CRON_SCHEDULE", "").strip()
-SSL_VERIFY = REMNA_BASE_URL.startswith("https://")
+    "https://raw.githubusercontent.com/pincetgore/PinRouting/refs/heads/main/HAPP/DEFAULT.DEEPLINK",
+).strip()
+RESPONSE_RULE_NAME = os.environ.get("RESPONSE_RULE_NAME", "Happ Clients").strip()
+CHECK_INTERVAL = max(60, int(os.environ.get("CHECK_INTERVAL", "3600")))
+REQUEST_TIMEOUT = max(5, int(os.environ.get("REQUEST_TIMEOUT", "30")))
+
+ROUTING_HEADER = "routing"
+HAPP_PREFIX = "happ://routing/onadd/"
 
 REMNA_HEADERS = {
     "Accept": "application/json",
     "Authorization": f"Bearer {REMNA_TOKEN}",
 }
-ROUTING_HEADER = "routing"
-
-if not SSL_VERIFY:
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+if REMNA_BASE_URL.startswith("http://"):
+    # The updater normally talks to Remnawave directly over the Docker network,
+    # while the public panel itself is served through HTTPS.
     REMNA_HEADERS["X-Forwarded-Proto"] = "https"
     REMNA_HEADERS["X-Forwarded-For"] = "127.0.0.1"
 
 
-def load_squad_configs() -> list:
-    squads = []
-    i = 1
-    while True:
-        uuid = os.environ.get(f"SQUAD_{i}_UUID", "").strip()
-        url = os.environ.get(f"SQUAD_{i}_URL", "").strip()
-        if not uuid or not url:
-            break
-        squads.append(
-            {
-                "uuid": uuid,
-                "url": url,
-                "current_routing": None,
-                "response_headers_add": {},
-                "response_headers_remove": [],
-            }
-        )
-        i += 1
-    return squads
-
-
-def get_routing_header(headers: dict | None) -> str:
-    for key, value in (headers or {}).items():
-        if key.lower() == ROUTING_HEADER:
-            return (value or "").strip()
-    return ""
-
-
-def with_routing_header(headers: dict | None, routing: str) -> dict:
-    merged = {key: value for key, value in (headers or {}).items() if key.lower() != ROUTING_HEADER}
-    merged[ROUTING_HEADER] = routing
-    return merged
+def request(method: str, url: str, **kwargs) -> requests.Response:
+    kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+    response = requests.request(method, url, **kwargs)
+    response.raise_for_status()
+    return response
 
 
 def get_remna_settings() -> dict:
-    resp = requests.get(
-        REMNA_API_URL,
-        headers=REMNA_HEADERS,
-        timeout=30,
-        verify=SSL_VERIFY,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    response = request("GET", REMNA_API_URL, headers=REMNA_HEADERS)
+    payload = response.json()
+    return payload.get("response", payload)
 
 
 def patch_remna_settings(payload: dict) -> dict:
-    resp = requests.patch(
+    response = request(
+        "PATCH",
         REMNA_API_URL,
         headers={**REMNA_HEADERS, "Content-Type": "application/json"},
         json=payload,
-        timeout=30,
-        verify=SSL_VERIFY,
     )
-    resp.raise_for_status()
-    return resp.json()
+    result = response.json()
+    return result.get("response", result)
 
 
-def get_external_squad(squad_uuid: str) -> dict:
-    resp = requests.get(
-        f"{REMNA_BASE_URL}/external-squads/{squad_uuid}",
-        headers=REMNA_HEADERS,
-        timeout=30,
-        verify=SSL_VERIFY,
-    )
-    resp.raise_for_status()
-    return resp.json()
+def fetch_happ_deeplink() -> tuple[str, dict]:
+    response = request("GET", GITHUB_RAW_URL)
+    deeplink = response.text.strip()
 
+    if not deeplink.startswith(HAPP_PREFIX):
+        raise ValueError(
+            f"Unexpected routing payload: expected prefix {HAPP_PREFIX!r}"
+        )
 
-def patch_external_squad(
-    squad_uuid: str,
-    response_headers_add: dict,
-    response_headers_remove: list,
-) -> dict:
-    payload = {
-        "uuid": squad_uuid,
-        "responseHeadersAdd": response_headers_add,
-    }
-    # Если routing был явно удалён в настройках сквада, убираем конфликт.
-    filtered_remove = [header for header in response_headers_remove if header.lower() != ROUTING_HEADER]
-    if filtered_remove != response_headers_remove:
-        payload["responseHeadersRemove"] = filtered_remove
+    encoded = deeplink[len(HAPP_PREFIX):].strip()
+    if not encoded:
+        raise ValueError("Happ routing deeplink contains an empty Base64 payload")
 
-    resp = requests.patch(
-        f"{REMNA_BASE_URL}/external-squads",
-        headers={**REMNA_HEADERS, "Content-Type": "application/json"},
-        json=payload,
-        timeout=30,
-        verify=SSL_VERIFY,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def get_github_deeplink(url: str) -> str:
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-    return resp.text.strip()
-
-
-def run_cycle(settings_uuid: str, state: dict, squads: list) -> None:
-    """Одна итерация проверки: сравнить роутинг на GitHub с текущим и обновить при изменении."""
     try:
-        github_deeplink = get_github_deeplink(GITHUB_RAW_URL)
-        log.info("Fetched GitHub deeplink (%d chars)", len(github_deeplink))
+        decoded = base64.b64decode(encoded, validate=True)
+        profile = json.loads(decoded.decode("utf-8"))
+    except Exception as exc:
+        raise ValueError("Happ routing deeplink contains invalid Base64/JSON") from exc
 
-        if github_deeplink != state["current_routing"]:
-            log.info("Routing changed! Updating subscription settings...")
-            updated_headers = with_routing_header(
-                state["custom_response_headers"],
-                github_deeplink,
-            )
-            result = patch_remna_settings(
-                {
-                    "uuid": settings_uuid,
-                    "customResponseHeaders": updated_headers,
-                }
-            )
-            state["custom_response_headers"] = updated_headers
-            state["current_routing"] = github_deeplink
-            log.info("Successfully updated routing response header in subscription settings")
-            log.debug("Patch response: %s", result)
-        else:
-            log.info("No changes detected in subscription settings")
+    if not isinstance(profile, dict):
+        raise ValueError("Happ routing profile is not a JSON object")
 
-    except Exception:
-        log.exception("Error during subscription settings check cycle")
+    name = profile.get("Name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Happ routing profile has no valid Name")
 
-    for squad in squads:
-        try:
-            deeplink = get_github_deeplink(squad["url"])
-            if deeplink != squad["current_routing"]:
-                log.info("Routing changed for squad %s! Updating...", squad["uuid"])
-                updated_headers = with_routing_header(
-                    squad["response_headers_add"],
-                    deeplink,
-                )
-                patch_external_squad(
-                    squad["uuid"],
-                    updated_headers,
-                    squad["response_headers_remove"],
-                )
-                squad["response_headers_add"] = updated_headers
-                squad["response_headers_remove"] = [header for header in squad["response_headers_remove"] if header.lower() != ROUTING_HEADER]
-                squad["current_routing"] = deeplink
-                log.info("Successfully updated routing response header for squad %s", squad["uuid"])
-            else:
-                log.info("No changes detected for squad %s", squad["uuid"])
-        except Exception:
-            log.exception("Error updating squad %s", squad["uuid"])
+    return deeplink, profile
 
 
-def main():
-    log.info("Starting routing update monitor")
-    log.info("Remna API: %s", REMNA_API_URL)
-    log.info("GitHub URL: %s", GITHUB_RAW_URL)
-    if CRON_SCHEDULE:
-        log.info("Mode: cron schedule '%s' (container local time)", CRON_SCHEDULE)
-    else:
-        log.info("Mode: interval polling every %ds", CHECK_INTERVAL)
+def get_header(headers: list[dict], key: str) -> str:
+    for header in headers:
+        if str(header.get("key", "")).lower() == key.lower():
+            return str(header.get("value", "")).strip()
+    return ""
 
-    # Fetch current settings on startup
-    settings = get_remna_settings()
-    data = settings.get("response", settings)
-    settings_uuid = data["uuid"]
-    custom_response_headers = data.get("customResponseHeaders", {}) or {}
-    state = {
-        "custom_response_headers": custom_response_headers,
-        "current_routing": get_routing_header(custom_response_headers),
+
+def set_header(headers: list[dict], key: str, value: str) -> bool:
+    """Set one response header. Returns True when the list changed."""
+    matches = [
+        index
+        for index, header in enumerate(headers)
+        if str(header.get("key", "")).lower() == key.lower()
+    ]
+
+    if not matches:
+        headers.append({"key": key, "value": value})
+        return True
+
+    changed = False
+    first = matches[0]
+    if headers[first].get("key") != key or headers[first].get("value") != value:
+        headers[first] = {"key": key, "value": value}
+        changed = True
+
+    # Keep exactly one routing header in the rule.
+    for index in reversed(matches[1:]):
+        del headers[index]
+        changed = True
+
+    return changed
+
+
+def remove_global_routing(custom_headers: dict | None) -> tuple[dict, bool]:
+    headers = dict(custom_headers or {})
+    cleaned = {
+        key: value
+        for key, value in headers.items()
+        if key.lower() != ROUTING_HEADER
     }
-    log.info("Settings UUID: %s", settings_uuid)
-    log.info("Current routing response header loaded (%d chars)", len(state["current_routing"]))
+    return cleaned, cleaned != headers
 
-    squads = load_squad_configs()
-    log.info("Loaded %d external squad(s)", len(squads))
-    for squad in squads:
-        try:
-            data = get_external_squad(squad["uuid"])
-            squad_data = data.get("response", data)
-            squad["response_headers_add"] = squad_data.get("responseHeadersAdd", {}) or {}
-            squad["response_headers_remove"] = squad_data.get("responseHeadersRemove", []) or []
-            squad["current_routing"] = get_routing_header(squad["response_headers_add"])
-            log.info(
-                "Squad %s current routing response header loaded (%d chars)",
-                squad["uuid"],
-                len(squad["current_routing"]),
-            )
-        except Exception:
-            log.exception("Failed to fetch initial routing for squad %s, will update on first cycle", squad["uuid"])
 
-    if CRON_SCHEDULE:
-        try:
-            from croniter import croniter
-        except ImportError:
-            raise SystemExit("CRON_SCHEDULE is set, but the 'croniter' package is not installed")
-        if not croniter.is_valid(CRON_SCHEDULE):
-            raise SystemExit(f"Invalid CRON_SCHEDULE expression: {CRON_SCHEDULE!r}")
+def get_target_rule(response_rules: dict) -> dict:
+    if not isinstance(response_rules, dict):
+        raise ValueError("Remnawave responseRules is missing or invalid")
 
-        # Синхронизируемся один раз при запуске, чтобы не ждать первого срабатывания
-        # расписания (например, после рестарта или деплоя), затем работаем по cron.
-        run_cycle(settings_uuid, state, squads)
-        schedule = croniter(CRON_SCHEDULE, datetime.now())
-        while True:
-            next_run = schedule.get_next(datetime)
-            delay = (next_run - datetime.now()).total_seconds()
-            if delay > 0:
-                log.info(
-                    "Next scheduled run at %s (in %ds)",
-                    next_run.isoformat(sep=" ", timespec="seconds"),
-                    int(delay),
-                )
-                time.sleep(delay)
-            run_cycle(settings_uuid, state, squads)
+    rules = response_rules.get("rules")
+    if not isinstance(rules, list):
+        raise ValueError("Remnawave responseRules.rules is missing or invalid")
+
+    target = next(
+        (rule for rule in rules if rule.get("name") == RESPONSE_RULE_NAME),
+        None,
+    )
+    if target is None:
+        raise ValueError(
+            f"Response rule {RESPONSE_RULE_NAME!r} was not found in Remnawave"
+        )
+    return target
+
+
+def get_rule_routing(response_rules: dict) -> tuple[str, bool]:
+    target = get_target_rule(response_rules)
+    modifications = target.get("responseModifications")
+    if not isinstance(modifications, dict):
+        return "", False
+
+    headers = modifications.get("headers")
+    if not isinstance(headers, list):
+        return "", modifications.get("applyHeadersToEnd") is True
+
+    return (
+        get_header(headers, ROUTING_HEADER),
+        modifications.get("applyHeadersToEnd") is True,
+    )
+
+
+def update_response_rules(response_rules: dict, deeplink: str) -> tuple[dict, str, bool]:
+    updated = copy.deepcopy(response_rules)
+    target = get_target_rule(updated)
+
+    response_type = str(target.get("responseType", ""))
+    if response_type != "XRAY_JSON":
+        log.warning(
+            "Rule %r has responseType=%r (expected XRAY_JSON for Happ)",
+            RESPONSE_RULE_NAME,
+            response_type,
+        )
+
+    modifications = target.setdefault("responseModifications", {})
+    if not isinstance(modifications, dict):
+        raise ValueError(
+            f"Rule {RESPONSE_RULE_NAME!r} has invalid responseModifications"
+        )
+
+    headers = modifications.setdefault("headers", [])
+    if not isinstance(headers, list):
+        raise ValueError(
+            f"Rule {RESPONSE_RULE_NAME!r} has invalid responseModifications.headers"
+        )
+
+    current = get_header(headers, ROUTING_HEADER)
+    changed = set_header(headers, ROUTING_HEADER, deeplink)
+
+    if modifications.get("applyHeadersToEnd") is not True:
+        modifications["applyHeadersToEnd"] = True
+        changed = True
+
+    return updated, current, changed
+
+
+def verify_applied(expected_deeplink: str) -> None:
+    settings = get_remna_settings()
+    current, applied_to_end = get_rule_routing(settings.get("responseRules"))
+
+    if current != expected_deeplink:
+        raise RuntimeError("Verification failed: routing header was not stored")
+    if not applied_to_end:
+        raise RuntimeError("Verification failed: applyHeadersToEnd is not enabled")
+
+    _, has_global = remove_global_routing(settings.get("customResponseHeaders"))
+    if has_global:
+        raise RuntimeError("Verification failed: global routing header still exists")
+
+
+def run_cycle() -> None:
+    deeplink, profile = fetch_happ_deeplink()
+    settings = get_remna_settings()
+
+    settings_uuid = settings.get("uuid")
+    if not settings_uuid:
+        raise ValueError("Remnawave response has no subscription settings UUID")
+
+    response_rules, current, rules_changed = update_response_rules(
+        settings.get("responseRules"),
+        deeplink,
+    )
+    custom_headers, global_changed = remove_global_routing(
+        settings.get("customResponseHeaders")
+    )
+
+    profile_name = profile.get("Name", "?")
+    last_updated = profile.get("LastUpdated", "?")
+
+    if not rules_changed and not global_changed:
+        log.info(
+            "No changes: %s is already current (LastUpdated=%s)",
+            profile_name,
+            last_updated,
+        )
+        return
+
+    payload = {
+        "uuid": settings_uuid,
+        "responseRules": response_rules,
+    }
+    if global_changed:
+        payload["customResponseHeaders"] = custom_headers
+        log.info("Removing legacy global routing header")
+
+    if current:
+        log.info(
+            "Updating %r routing (%d -> %d chars)",
+            RESPONSE_RULE_NAME,
+            len(current),
+            len(deeplink),
+        )
     else:
-        while True:
-            run_cycle(settings_uuid, state, squads)
-            time.sleep(CHECK_INTERVAL)
+        log.info(
+            "Adding routing header to %r (%d chars)",
+            RESPONSE_RULE_NAME,
+            len(deeplink),
+        )
+
+    patch_remna_settings(payload)
+    verify_applied(deeplink)
+    log.info(
+        "Routing updated successfully: %s (LastUpdated=%s)",
+        profile_name,
+        last_updated,
+    )
+
+
+def main() -> None:
+    if not REMNA_TOKEN:
+        raise SystemExit("REMNA_TOKEN is empty")
+    if not RESPONSE_RULE_NAME:
+        raise SystemExit("RESPONSE_RULE_NAME is empty")
+
+    log.info("Starting Remnawave Happ routing updater")
+    log.info("Remnawave API: %s", REMNA_API_URL)
+    log.info("Source: %s", GITHUB_RAW_URL)
+    log.info("Target response rule: %s", RESPONSE_RULE_NAME)
+    log.info("Check interval: %ds", CHECK_INTERVAL)
+
+    while True:
+        try:
+            run_cycle()
+            sleep_for = CHECK_INTERVAL
+        except Exception:
+            log.exception("Routing update cycle failed")
+            sleep_for = min(CHECK_INTERVAL, 300)
+        time.sleep(sleep_for)
 
 
 if __name__ == "__main__":
