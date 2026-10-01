@@ -1,7 +1,8 @@
 services:
-  routing-updater:
+  routing:
     build: .
-    container_name: remnawave-routing-autoupdate
+    image: remnawave-routing:local
+    container_name: remnawave-routing
     restart: unless-stopped
     env_file:
       - .env
